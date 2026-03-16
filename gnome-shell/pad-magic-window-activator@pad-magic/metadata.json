@@ -1,0 +1,8 @@
+{
+  "uuid": "pad-magic-window-activator@pad-magic",
+  "name": "Pad Magic Window Activator",
+  "description": "Expose a tiny D-Bus API that lets Pad Magic activate a matching window title from inside GNOME Shell.",
+  "shell-version": ["49"],
+  "url": "https://local.pad-magic",
+  "version": 1
+}

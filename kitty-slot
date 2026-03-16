@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOCK="${XDG_RUNTIME_DIR:-/tmp}/kitty-midi.sock"
+SLOT_VAR_NAME="pad_magic_slot"
+SLOT_KEY_VAR_NAME="pad_magic_slot_key"
+KITTY_BACKEND_SERVICE="kitty-midi-backend.service"
+KITTY_BACKEND_CLASS="pad-magic-kitty"
+OS_WINDOW_TITLE_PREFIX="Pad Magic :: "
+GNOME_ACTIVATOR_BUS_NAME="org.gnome.Shell.Extensions.PadMagicWindowActivator"
+GNOME_ACTIVATOR_OBJECT_PATH="/org/gnome/Shell/Extensions/PadMagicWindowActivator"
+GNOME_ACTIVATOR_INTERFACE="org.gnome.Shell.Extensions.PadMagicWindowActivator"
+
+# Real terminal size in CELLS
+REAL_W=84
+REAL_H=25
+
+start_backend() {
+  if backend_alive; then
+    return
+  fi
+
+  # Recover from stale sockets left behind after the last kitty process exits.
+  if [ -S "$SOCK" ]; then
+    rm -f "$SOCK"
+  fi
+
+  start_backend_via_service || start_backend_direct
+
+  if ! wait_for_backend; then
+    echo "Failed to start kitty backend on $SOCK" >&2
+    exit 1
+  fi
+}
+
+backend_alive() {
+  kitten @ --to "unix:$SOCK" ls >/dev/null 2>&1
+}
+
+wait_for_backend() {
+  local attempt
+
+  for attempt in $(seq 1 20); do
+    if backend_alive; then
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  return 1
+}
+
+start_backend_via_service() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if ! systemctl --user cat "$KITTY_BACKEND_SERVICE" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  systemctl --user start "$KITTY_BACKEND_SERVICE" >/dev/null 2>&1 || return 1
+}
+
+start_backend_direct() {
+  env KITTY_DISABLE_WAYLAND=1 kitty \
+    --class "$KITTY_BACKEND_CLASS" \
+    --name "$KITTY_BACKEND_CLASS" \
+    -o allow_remote_control=yes \
+    --listen-on "unix:$SOCK" \
+    --start-as=minimized \
+    --override linux_display_server=x11 \
+    --override remember_window_size=no \
+    --override initial_window_width="${REAL_W}c" \
+    --override initial_window_height="${REAL_H}c" \
+    --override confirm_os_window_close=0 &
+}
+
+slot_exists() {
+  local slot="$1"
+  window_exists "$(slot_match "$slot")" || window_exists "$(legacy_slot_match "$slot")"
+}
+
+window_exists() {
+  local match="$1"
+  kitten @ --to "unix:$SOCK" set-user-vars --match "$match" >/dev/null 2>&1
+}
+
+# Match against a space-safe key because kitty parses match queries itself.
+slot_key() {
+  local slot="$1"
+  printf '%s' "$slot" | base64 | tr -d '\n=' | tr '/+' '_-'
+}
+
+slot_match() {
+  local slot="$1"
+  printf 'var:%s=%s' "$SLOT_KEY_VAR_NAME" "$(slot_key "$slot")"
+}
+
+slot_os_window_title() {
+  local slot="$1"
+  printf '%s%s' "$OS_WINDOW_TITLE_PREFIX" "$slot"
+}
+
+legacy_slot_match() {
+  local slot="$1"
+  printf 'var:%s=%s' "$SLOT_VAR_NAME" "$slot"
+}
+
+raise_slot() {
+  local slot="$1"
+  local output
+
+  if command -v gdbus >/dev/null 2>&1; then
+    if output="$(
+      gdbus call \
+        --session \
+        --dest "$GNOME_ACTIVATOR_BUS_NAME" \
+        --object-path "$GNOME_ACTIVATOR_OBJECT_PATH" \
+        --method "${GNOME_ACTIVATOR_INTERFACE}.ActivateWindow" \
+        "$(slot_os_window_title "$slot")" 2>/dev/null
+    )"; then
+      case "$output" in
+        *true*)
+          return 0
+          ;;
+      esac
+    fi
+  fi
+
+  if ! command -v wmctrl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  wmctrl -F -a "$(slot_os_window_title "$slot")" >/dev/null 2>&1
+}
+
+show_slot() {
+  local slot="$1"
+  kitten @ --to "unix:$SOCK" resize-os-window \
+    --action show \
+    --match "$(slot_match "$slot")" ||
+    kitten @ --to "unix:$SOCK" resize-os-window \
+      --action show \
+      --match "$(legacy_slot_match "$slot")"
+}
+
+focus_slot() {
+  local slot="$1"
+  kitten @ --to "unix:$SOCK" focus-window \
+    --match "$(slot_match "$slot")" ||
+    kitten @ --to "unix:$SOCK" focus-window \
+      --match "$(legacy_slot_match "$slot")"
+}
+
+create_slot() {
+  local slot="$1"
+  local window_id
+
+  window_id="$(kitten @ --to "unix:$SOCK" launch \
+    --type=os-window \
+    --var "$SLOT_VAR_NAME=$slot" \
+    --var "$SLOT_KEY_VAR_NAME=$(slot_key "$slot")" \
+    --env "PAD_MAGIC_SLOT=$slot" \
+    --os-window-title "$(slot_os_window_title "$slot")" \
+    --cwd ~)" \
+
+  sleep 0.4
+
+  kitten @ --to "unix:$SOCK" resize-os-window \
+    --match "id:${window_id}" \
+    --unit cells \
+    --width "$REAL_W" \
+    --height "$REAL_H" || true
+
+  raise_slot "$slot" || true
+}
+
+show_or_create_slot() {
+  local slot="$1"
+
+  start_backend
+
+  if slot_exists "$slot"; then
+    show_slot "$slot" >/dev/null 2>&1 || true
+    focus_slot "$slot" >/dev/null 2>&1 || true
+    if raise_slot "$slot"; then
+      sleep 0.3
+    elif focus_slot "$slot"; then
+      sleep 0.3
+    else
+      create_slot "$slot"
+      return
+    fi
+  else
+    create_slot "$slot"
+  fi
+}
+
+main() {
+  local slot
+
+  if [ $# -lt 1 ]; then
+    echo "Usage: $0 <window name>" >&2
+    exit 1
+  fi
+
+  slot="$*"
+  show_or_create_slot "$slot"
+}
+
+main "$@"

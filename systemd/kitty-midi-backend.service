@@ -1,0 +1,14 @@
+[Unit]
+Description=Pad Magic kitty backend
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/rm -f %t/kitty-midi.sock
+ExecStart=/usr/bin/env KITTY_DISABLE_WAYLAND=1 /usr/bin/kitty --class pad-magic-kitty --name pad-magic-kitty -o allow_remote_control=yes --listen-on unix:%t/kitty-midi.sock --start-as=minimized --override linux_display_server=x11 --override remember_window_size=no --override initial_window_width=84c --override initial_window_height=25c --override confirm_os_window_close=0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Pad Magic BLE MIDI bridge
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/ChonkyBoy/code/pad-magic
+ExecStart=/usr/bin/python3 /mnt/ChonkyBoy/code/pad-magic/midi_ble_bridge.py run
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+Environment=MIDO_BACKEND=mido.backends.rtmidi
+
+[Install]
+WantedBy=default.target
