@@ -6,6 +6,8 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 import json
+import shutil
+import subprocess
 from pathlib import Path
 import platform
 import sys
@@ -447,6 +449,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--verbose", action="store_true")
 
     subparsers.add_parser("run", help="Run the BLE MIDI bridge.")
+
+    install_parser = subparsers.add_parser(
+        "install",
+        help="Copy runtime files into ~/.local/lib/pad-magic and (re)install systemd user units.",
+    )
+    install_parser.add_argument(
+        "--prefix",
+        default=str(Path.home() / ".local" / "lib" / "pad-magic"),
+        help="Directory to copy runtime files into.",
+    )
+    install_parser.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="Skip daemon-reload and service (re)start.",
+    )
+
     return parser
 
 
@@ -469,6 +487,144 @@ def command_init(args: argparse.Namespace) -> int:
     return 0
 
 
+RUNTIME_FILES = (
+    "midi_ble_bridge.py",
+    "midi_execute.py",
+    "midi_configure.py",
+    "midi_triggers_common.py",
+    "kitty-slot",
+    "raise-or-launch",
+)
+
+GNOME_EXTENSION_DIR = "gnome-shell/pad-magic-window-activator@pad-magic"
+GNOME_EXTENSION_UUID = "pad-magic-window-activator@pad-magic"
+
+SERVICE_UNITS = {
+    "midi-ble-bridge.service": """[Unit]
+Description=Pad Magic BLE MIDI bridge
+
+[Service]
+Type=simple
+WorkingDirectory={prefix}
+ExecStart=/usr/bin/python3 {prefix}/midi_ble_bridge.py run
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+Environment=MIDO_BACKEND=mido.backends.rtmidi
+
+[Install]
+WantedBy=default.target
+""",
+    "midi-execute.service": """[Unit]
+Description=MIDI trigger executor
+
+[Service]
+Type=simple
+WorkingDirectory={prefix}
+ExecStart=/usr/bin/python3 {prefix}/midi_execute.py
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+""",
+    "kitty-midi-backend.service": """[Unit]
+Description=Pad Magic kitty backend
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/rm -f %t/kitty-midi.sock
+ExecStart=/usr/bin/kitty -o allow_remote_control=yes --listen-on unix:%t/kitty-midi.sock --start-as=minimized --override remember_window_size=no --override initial_window_width=84c --override initial_window_height=25c --override confirm_os_window_close=0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+""",
+}
+
+
+def _systemctl_user(*args: str) -> int:
+    result = subprocess.run(
+        ["systemctl", "--user", *args],
+        check=False,
+    )
+    return result.returncode
+
+
+def command_install(args: argparse.Namespace) -> int:
+    source_dir = Path(__file__).resolve().parent
+    prefix = Path(args.prefix).expanduser().resolve()
+    prefix.mkdir(parents=True, exist_ok=True)
+
+    if prefix == source_dir:
+        print(f"Source directory equals install prefix ({prefix}); skipping copy.")
+    else:
+        for name in RUNTIME_FILES:
+            src = source_dir / name
+            if not src.exists():
+                print(f"warning: missing source file {src}, skipping")
+                continue
+            dst = prefix / name
+            shutil.copy2(src, dst)
+            if src.stat().st_mode & 0o111:
+                dst.chmod(0o755)
+            else:
+                dst.chmod(0o644)
+            print(f"installed {dst}")
+
+    extension_src = source_dir / GNOME_EXTENSION_DIR
+    if extension_src.is_dir():
+        extension_dst = (
+            Path.home()
+            / ".local"
+            / "share"
+            / "gnome-shell"
+            / "extensions"
+            / GNOME_EXTENSION_UUID
+        )
+        extension_dst.mkdir(parents=True, exist_ok=True)
+        for entry in extension_src.iterdir():
+            if entry.is_file():
+                target = extension_dst / entry.name
+                shutil.copy2(entry, target)
+                target.chmod(0o644)
+                print(f"installed {target}")
+
+    units_dir = Path.home() / ".config" / "systemd" / "user"
+    units_dir.mkdir(parents=True, exist_ok=True)
+    for unit_name, template in SERVICE_UNITS.items():
+        unit_path = units_dir / unit_name
+        unit_path.write_text(template.format(prefix=prefix))
+        unit_path.chmod(0o644)
+        print(f"wrote {unit_path}")
+
+    if args.no_restart:
+        print("Skipping daemon-reload and service restart (per --no-restart).")
+        return 0
+
+    if not shutil.which("systemctl"):
+        print("systemctl not found; skipping daemon-reload and restart.")
+        return 0
+
+    _systemctl_user("daemon-reload")
+    units_to_enable = [
+        name for name in SERVICE_UNITS if not name.startswith("kitty-midi-backend")
+    ]
+    units_to_enable.append("kitty-midi-backend.service")
+    _systemctl_user("enable", *units_to_enable)
+    _systemctl_user("reset-failed", *units_to_enable)
+    _systemctl_user("restart", *units_to_enable)
+
+    print("\nInstall complete.")
+    print(f"Runtime files: {prefix}")
+    print(f"Unit files:    {units_dir}")
+    return 0
+
+
 def command_run() -> int:
     config = load_config()
     bridge = MidiBleBridge(config)
@@ -488,6 +644,8 @@ def main() -> int:
         return asyncio.run(scan_devices(args.timeout))
     if command == "init":
         return command_init(args)
+    if command == "install":
+        return command_install(args)
     return command_run()
 
 

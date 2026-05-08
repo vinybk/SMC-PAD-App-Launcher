@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GNOME_ACTIVATOR_BUS_NAME="org.gnome.Shell.Extensions.PadMagicWindowActivator"
+GNOME_ACTIVATOR_OBJECT_PATH="/org/gnome/Shell/Extensions/PadMagicWindowActivator"
+GNOME_ACTIVATOR_INTERFACE="org.gnome.Shell.Extensions.PadMagicWindowActivator"
+
+title=""
+title_contains=""
+wm_class=""
+wm_class_instance=""
+app_id=""
+gtk_application_id=""
+sandboxed_app_id=""
+list_windows=0
+
+usage() {
+  cat <<'EOF'
+Usage:
+  raise-or-launch [match options] -- command [args...]
+  raise-or-launch --list
+
+Match options:
+  --title TEXT
+  --title-contains TEXT
+  --wm-class TEXT
+  --wm-class-instance TEXT
+  --app-id TEXT
+  --gtk-application-id TEXT
+  --sandboxed-app-id TEXT
+  --list
+EOF
+}
+
+json_escape() {
+  local value="$1"
+
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+
+  printf '%s' "$value"
+}
+
+append_json_field() {
+  local key="$1"
+  local value="$2"
+
+  if [ -z "$value" ]; then
+    return
+  fi
+
+  if [ "$criteria_json" != "{" ]; then
+    criteria_json+=","
+  fi
+
+  criteria_json+="\"$(json_escape "$key")\":\"$(json_escape "$value")\""
+}
+
+call_activator() {
+  gdbus call \
+    --session \
+    --dest "$GNOME_ACTIVATOR_BUS_NAME" \
+    --object-path "$GNOME_ACTIVATOR_OBJECT_PATH" \
+    --method "${GNOME_ACTIVATOR_INTERFACE}.$1" \
+    "${@:2}" 2>/dev/null
+}
+
+print_list_windows() {
+  local output
+
+  output="$(call_activator "ListWindows")" || {
+    echo "Could not reach the Pad Magic GNOME extension." >&2
+    exit 1
+  }
+
+  if command -v python3 >/dev/null 2>&1; then
+    OUTPUT="$output" python3 - <<'PY'
+import ast
+import json
+import os
+import sys
+
+raw = os.environ.get("OUTPUT", "")
+try:
+    payload = ast.literal_eval(raw)[0]
+except Exception:
+    print(raw)
+    sys.exit(0)
+
+try:
+    print(json.dumps(json.loads(payload), indent=2))
+except Exception:
+    print(payload)
+PY
+    return
+  fi
+
+  printf '%s\n' "$output"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --title)
+      title="${2:-}"
+      shift 2
+      ;;
+    --title-contains)
+      title_contains="${2:-}"
+      shift 2
+      ;;
+    --wm-class)
+      wm_class="${2:-}"
+      shift 2
+      ;;
+    --wm-class-instance)
+      wm_class_instance="${2:-}"
+      shift 2
+      ;;
+    --app-id)
+      app_id="${2:-}"
+      shift 2
+      ;;
+    --gtk-application-id)
+      gtk_application_id="${2:-}"
+      shift 2
+      ;;
+    --sandboxed-app-id)
+      sandboxed_app_id="${2:-}"
+      shift 2
+      ;;
+    --list)
+      list_windows=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [ "$list_windows" -eq 1 ]; then
+  print_list_windows
+  exit 0
+fi
+
+criteria_json="{"
+append_json_field "title" "$title"
+append_json_field "titleContains" "$title_contains"
+append_json_field "wmClass" "$wm_class"
+append_json_field "wmClassInstance" "$wm_class_instance"
+append_json_field "appId" "$app_id"
+append_json_field "gtkApplicationId" "$gtk_application_id"
+append_json_field "sandboxedAppId" "$sandboxed_app_id"
+criteria_json+="}"
+
+if [ "$criteria_json" = "{}" ]; then
+  echo "At least one match option is required." >&2
+  usage >&2
+  exit 1
+fi
+
+if output="$(call_activator "ActivateWindowMatching" "$criteria_json")"; then
+  case "$output" in
+    *true*)
+      exit 0
+      ;;
+  esac
+fi
+
+if [ $# -eq 0 ]; then
+  exit 1
+fi
+
+exec "$@"
